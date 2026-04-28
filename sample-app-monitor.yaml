@@ -1,0 +1,22 @@
+# servicemonitor/sample-app-monitor.yaml
+# Tells Prometheus to scrape metrics from sample-app in dev and staging
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sample-app-monitor
+  namespace: monitoring          # Must be in monitoring namespace
+  labels:
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - dev
+      - staging
+  selector:
+    matchLabels:
+      app: sample-app
+  endpoints:
+    - port: http
+      path: /metrics             # Your Flask app needs a /metrics endpoint
+      interval: 30s

@@ -1,0 +1,279 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sample-app-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+
+    # ─── SCENARIO 1: POD CRASH LOOP ──────────────────────────────────────────
+    # Real case: bad code pushed, app exits on startup, pod keeps restarting
+    # How you find it: kubectl get pods shows CrashLoopBackOff
+    # Prometheus detects: restart counter increasing rapidly
+    - name: pod-crash-loop
+      interval: 30s
+      rules:
+        - alert: SampleAppCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{
+              namespace=~"dev|staging",
+              container="sample-app"
+            }[5m]) * 60 > 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pod crash looping in {{ $labels.namespace }}"
+            description: |
+              Pod {{ $labels.pod }} in {{ $labels.namespace }} is restarting.
+              Debug steps:
+              1. kubectl get pods -n {{ $labels.namespace }}
+              2. kubectl logs {{ $labels.pod }} -n {{ $labels.namespace }} --previous
+              3. kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+
+    # ─── SCENARIO 2: APP COMPLETELY DOWN ─────────────────────────────────────
+    # Real case: wrong image tag pushed, imagePullBackOff, 0 pods available
+    # How you find it: kube-state-metrics shows 0 available replicas
+    - name: app-availability
+      interval: 30s
+      rules:
+        - alert: SampleAppDown
+          expr: |
+            kube_deployment_status_replicas_available{
+              namespace=~"dev|staging",
+              deployment="sample-app"
+            } == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Sample app is completely down in {{ $labels.namespace }}"
+            description: |
+              Deployment sample-app in {{ $labels.namespace }} has 0 available replicas.
+              Debug steps:
+              1. kubectl get pods -n {{ $labels.namespace }}
+              2. kubectl describe deployment sample-app -n {{ $labels.namespace }}
+              3. kubectl get events -n {{ $labels.namespace }} --sort-by='.lastTimestamp'
+
+        # ─── SCENARIO 3: REPLICA MISMATCH ────────────────────────────────────
+        # Real case: node went down, pod evicted, desired != available
+        # How you find it: deployment shows 2/3 ready
+        - alert: SampleAppReplicasMismatch
+          expr: |
+            kube_deployment_spec_replicas{
+              namespace=~"dev|staging",
+              deployment="sample-app"
+            }
+            !=
+            kube_deployment_status_replicas_available{
+              namespace=~"dev|staging",
+              deployment="sample-app"
+            }
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Replicas mismatch in {{ $labels.namespace }}"
+            description: |
+              sample-app in {{ $labels.namespace }} desired vs available mismatch.
+              Debug steps:
+              1. kubectl get pods -n {{ $labels.namespace }} -o wide
+              2. kubectl get nodes
+              3. kubectl describe pod <pending-pod> -n {{ $labels.namespace }}
+
+    # ─── SCENARIO 4: HIGH MEMORY USAGE ───────────────────────────────────────
+    # Real case: memory leak in app, pod approaching limit, OOMKill coming
+    # How you find it: container_memory_working_set_bytes approaching limits
+    - name: memory-pressure
+      interval: 30s
+      rules:
+        - alert: SampleAppHighMemory
+          expr: |
+            (
+              container_memory_working_set_bytes{
+                namespace=~"dev|staging",
+                container="sample-app"
+              }
+              /
+              kube_pod_container_resource_limits{
+                namespace=~"dev|staging",
+                container="sample-app",
+                resource="memory"
+              }
+            ) * 100 > 80
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High memory in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: |
+              Pod {{ $labels.pod }} memory usage is above 80% of limit.
+              Debug steps:
+              1. kubectl top pod -n {{ $labels.namespace }}
+              2. kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+              3. Check for memory leaks in application logs
+
+        # OOMKilled — container already killed due to memory
+        - alert: SampleAppOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{
+              namespace=~"dev|staging",
+              container="sample-app",
+              reason="OOMKilled"
+            } == 1
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "OOMKilled in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: |
+              Pod {{ $labels.pod }} was OOMKilled in {{ $labels.namespace }}.
+              Debug steps:
+              1. kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+              2. kubectl logs {{ $labels.pod }} -n {{ $labels.namespace }} --previous
+              3. Increase memory limit in deployment.yaml
+
+    # ─── SCENARIO 5: HIGH CPU USAGE ──────────────────────────────────────────
+    # Real case: traffic spike or infinite loop in app, throttling starts
+    # How you find it: CPU throttling metric from cAdvisor
+    - name: cpu-pressure
+      interval: 30s
+      rules:
+        - alert: SampleAppHighCPU
+          expr: |
+            (
+              rate(container_cpu_usage_seconds_total{
+                namespace=~"dev|staging",
+                container="sample-app"
+              }[5m])
+              /
+              kube_pod_container_resource_limits{
+                namespace=~"dev|staging",
+                container="sample-app",
+                resource="cpu"
+              }
+            ) * 100 > 80
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High CPU in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: |
+              Pod {{ $labels.pod }} CPU usage above 80% of limit.
+              Debug steps:
+              1. kubectl top pod -n {{ $labels.namespace }}
+              2. kubectl top pod -n {{ $labels.namespace }} --sort-by=cpu
+              3. Check application for infinite loops or traffic spike
+
+    # ─── SCENARIO 6: POD PENDING TOO LONG ────────────────────────────────────
+    # Real case: insufficient node resources, pod stuck in Pending
+    # How you find it: pod shows Pending, no node has enough CPU/memory
+    - name: pod-scheduling
+      interval: 30s
+      rules:
+        - alert: SampleAppPodPending
+          expr: |
+            kube_pod_status_phase{
+              namespace=~"dev|staging",
+              phase="Pending"
+            } == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod stuck Pending in {{ $labels.namespace }}"
+            description: |
+              Pod {{ $labels.pod }} has been Pending for 5 minutes.
+              Debug steps:
+              1. kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+              2. Look at Events section — check for Insufficient CPU/memory
+              3. kubectl describe nodes | grep -A5 "Allocated resources"
+              4. kubectl get nodes
+
+        # ImagePullBackOff — wrong tag or private image
+        - alert: SampleAppImagePullFailed
+          expr: |
+            kube_pod_container_status_waiting_reason{
+              namespace=~"dev|staging",
+              reason=~"ImagePullBackOff|ErrImagePull"
+            } == 1
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Image pull failed in {{ $labels.namespace }}"
+            description: |
+              Pod {{ $labels.pod }} cannot pull image in {{ $labels.namespace }}.
+              Debug steps:
+              1. kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+              2. Check image name and tag in deployment.yaml
+              3. Verify image exists on DockerHub
+              4. kubectl get events -n {{ $labels.namespace }}
+
+    # ─── SCENARIO 7: NODE MEMORY PRESSURE ────────────────────────────────────
+    # Real case: node running low on memory, pods get evicted
+    # How you find it: node-exporter shows high memory utilization
+    - name: node-health
+      interval: 30s
+      rules:
+        - alert: NodeMemoryPressure
+          expr: |
+            (
+              node_memory_MemAvailable_bytes
+              /
+              node_memory_MemTotal_bytes
+            ) * 100 < 20
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Node {{ $labels.instance }} low on memory"
+            description: |
+              Node {{ $labels.instance }} has less than 20% memory available.
+              Debug steps:
+              1. kubectl top nodes
+              2. kubectl describe node {{ $labels.instance }}
+              3. kubectl get pods -A -o wide | grep {{ $labels.instance }}
+              4. Check for memory-hungry pods and evict if needed
+
+        # Node disk pressure
+        - alert: NodeDiskPressure
+          expr: |
+            (
+              node_filesystem_avail_bytes{mountpoint="/"}
+              /
+              node_filesystem_size_bytes{mountpoint="/"}
+            ) * 100 < 20
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Node {{ $labels.instance }} low on disk"
+            description: |
+              Node {{ $labels.instance }} has less than 20% disk available.
+              Debug steps:
+              1. kubectl describe node {{ $labels.instance }}
+              2. docker system prune (clear unused images)
+              3. kubectl get pods -A | grep Evicted
+
+        # Node not ready
+        - alert: NodeNotReady
+          expr: |
+            kube_node_status_condition{
+              condition="Ready",
+              status="true"
+            } == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Node {{ $labels.node }} is NotReady"
+            description: |
+              Node {{ $labels.node }} has been NotReady for 2 minutes.
+              Debug steps:
+              1. kubectl get nodes
+              2. kubectl describe node {{ $labels.node }}
+              3. Check kubelet: systemctl status kubelet
+              4. kubectl get events -A | grep {{ $labels.node }}
